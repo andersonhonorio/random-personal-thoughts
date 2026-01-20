@@ -1,0 +1,441 @@
+# Módulo de Prevenção a Fraude e Rate Limiting (SFCC)
+
+## 1. Introdução
+Este documento detalha a implementação de uma solução de segurança para o Salesforce Commerce Cloud (SFCC) visando mitigar fraudes e ataques de força bruta (bots). A solução utiliza uma abordagem híbrida e em camadas:
+
+1.  **Monitoramento de Velocidade (Rate Limiting):** Monitora requisições por IP em janelas de tempo.
+2.  **Step-up Authentication:** Solicita reCAPTCHA se o usuário exceder um limite leve (Soft Limit).
+3.  **Bloqueio Automático:** Bloqueia o IP temporariamente (15 min) se exceder o limite rígido (Hard Limit).
+4.  **Bloqueio Lógico:** Permite bloquear usuários específicos (via CustomerID) caso o gateway de pagamento confirme fraude.
+5.  **Gestão:** Painel no Business Manager para visualização e desbloqueio manual.
+
+---
+
+## 2. Arquitetura
+
+Abaixo está o diagrama de componentes seguindo o modelo C4 (Container Diagram), ilustrando a interação entre os Controllers, Scripts Helpers, Custom Objects e Serviços Externos.
+
+### Diagrama C4 (PlantUML)
+
+```plantuml
+@startuml
+!include [https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml](https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml)
+
+LAYOUT_WITH_LEGEND()
+
+title Diagrama de Componentes - Sistema Anti-Fraude SFCC
+
+Person(shopper, "Cliente / Bot", "Realiza checkout")
+Person(admin, "Agente SAC", "Gerencia bloqueios")
+
+System_Ext(google, "Google reCAPTCHA", "Valida desafio humano")
+System_Ext(gateway, "Payment Gateway", "Adyen, Cybersource, etc.")
+
+Container_Boundary(sfcc, "SFCC B2C Commerce") {
+    
+    Component(checkout_ctrl, "CheckoutServices", "Controller", "Orquestra pagamento")
+    Component(admin_ctrl, "FraudAdmin", "Controller", "Painel BM")
+    
+    Component(vel_mgr, "VelocityMgr", "Script Helper", "Regras de Velocidade e Captcha")
+    Component(fraud_mgr, "FraudMgr", "Script Helper", "Regras de Bloqueio Persistente")
+    Component(recaptcha_svc, "RecaptchaService", "Service Framework", "API Google")
+    Component(job_cleanup, "FraudCleanup", "Job Schedule", "Limpeza de dados")
+
+    ComponentDb(co_velocity, "CO: FraudVelocity", "Custom Object", "Contador (IP)")
+    ComponentDb(co_block, "CO: FraudTempBlock", "Custom Object", "Lista Negra (IP/User)")
+}
+
+Rel(shopper, checkout_ctrl, "1. Envia Pagamento", "HTTPS")
+Rel(checkout_ctrl, fraud_mgr, "2. Verifica Bloqueio", "isBlocked()")
+Rel(checkout_ctrl, vel_mgr, "3. Checa Velocidade", "checkStatus()")
+Rel(vel_mgr, co_velocity, "Lê/Escreve", "Transaction")
+
+Rel(vel_mgr, recaptcha_svc, "4. Se status=REQUIRE_CAPTCHA", "Verify()")
+Rel(recaptcha_svc, google, "Valida Token", "HTTPS")
+
+Rel(vel_mgr, fraud_mgr, "5. Se status=BLOCK", "blockIP()")
+Rel(fraud_mgr, co_block, "Escreve Bloqueio", "Transaction")
+
+Rel(checkout_ctrl, gateway, "6. Authorize", "HTTPS")
+Rel(checkout_ctrl, fraud_mgr, "7. Se Fraude Confirmada", "blockCustomer()")
+
+Rel(admin, admin_ctrl, "Painel Admin", "HTTPS/BM")
+Rel(admin_ctrl, co_block, "Gerencia", "API")
+Rel(job_cleanup, co_velocity, "Limpa", "Scheduled")
+@enduml
+
+
+# 3. Configuração Business Manager
+
+### A. Custom Objects
+Caminho: *Administration > Site Development > Custom Object Definitions*
+
+| ID Objeto | Key Attribute | Type | Custom Attributes (Colunas) |
+| :--- | :--- | :--- | :--- |
+| **FraudTempBlock** | `customKey` | String | `blockExpiration` (DateTime)<br>`reason` (String) |
+| **FraudVelocity** | `clientIP` | String | `requestCount` (Integer)<br>`windowStartTime` (DateTime)<br>`captchaVerifiedUntil` (DateTime) |
+
+### B. Serviços
+Caminho: *Administration > Operations > Services*
+
+1. Crie um Profile:
+   * **Name:** `GoogleRecaptchaProfile`
+   * **URL:** `https://www.google.com/recaptcha/api/siteverify`
+
+2. Crie uma Credencial:
+   * **Name:** `GoogleRecaptchaCreds`
+   * **User/Pass:** Deixe em branco (não é necessário para esta API).
+
+3. Crie o Serviço:
+   * **Name:** `GoogleRecaptcha.Verify`
+   * **Profile:** `GoogleRecaptchaProfile`
+   * **Credential:** `GoogleRecaptchaCreds`
+
+### C. Site Preferences
+1. Crie um grupo ou adicione às preferências existentes.
+2. **ID:** `recaptchaSecretKey`
+3. **Type:** String (Masked/Password) - *Para guardar a chave secreta do Google.*
+
+
+4. Códigos: Camada Core e Storefront
+4.1. Helpers (Lógica de Negócio)
+Arquivo: */cartridge/scripts/helpers/FraudMgr.js
+Responsável por gerenciar a "Lista Negra" persistente
+
+'use strict';
+
+var CustomObjectMgr = require('dw/object/CustomObjectMgr');
+var Transaction = require('dw/system/Transaction');
+var Calendar = require('dw/util/Calendar');
+
+var TYPE_IP = 'IP_';
+var TYPE_USER = 'USER_';
+
+function createBlockRecord(uniqueKey, minutes, reason) {
+    Transaction.wrap(function () {
+        var blockRecord = CustomObjectMgr.getCustomObject('FraudTempBlock', uniqueKey);
+        if (!blockRecord) {
+            blockRecord = CustomObjectMgr.createCustomObject('FraudTempBlock', uniqueKey);
+        }
+        var cal = new Calendar();
+        cal.add(Calendar.MINUTE, minutes);
+        blockRecord.custom.blockExpiration = cal.time;
+        if (reason) blockRecord.custom.reason = reason;
+    });
+}
+
+function blockCustomer(customerNo, minutes) {
+    if (!customerNo) return;
+    createBlockRecord(TYPE_USER + customerNo, minutes, 'Fraude Confirmada (Gateway)');
+}
+
+function blockIP(ipAddress, minutes) {
+    if (!ipAddress) return;
+    createBlockRecord(TYPE_IP + ipAddress, minutes, 'Rate Limit Excedido');
+}
+
+function isBlocked(ipAddress, customerNo) {
+    var now = new Date();
+    // Verifica IP
+    if (ipAddress) {
+        var ipObj = CustomObjectMgr.getCustomObject('FraudTempBlock', TYPE_IP + ipAddress);
+        if (ipObj && ipObj.custom.blockExpiration > now) return true;
+    }
+    // Verifica Usuário
+    if (customerNo) {
+        var userObj = CustomObjectMgr.getCustomObject('FraudTempBlock', TYPE_USER + customerNo);
+        if (userObj && userObj.custom.blockExpiration > now) return true;
+    }
+    return false;
+}
+
+module.exports = {
+    blockCustomer: blockCustomer,
+    blockIP: blockIP,
+    isBlocked: isBlocked
+};
+
+
+Arquivo: */cartridge/scripts/helpers/VelocityMgr.js
+Responsável pela contagem de tentativas e decisão de Captcha/Bloqueio.
+
+'use strict';
+
+var CustomObjectMgr = require('dw/object/CustomObjectMgr');
+var Transaction = require('dw/system/Transaction');
+var FraudMgr = require('*/cartridge/scripts/helpers/FraudMgr');
+
+// Configurações
+var LIMIT_SOFT = 4; // Pedir Captcha
+var LIMIT_HARD = 8; // Bloquear IP
+var WINDOW_SEC = 60; // Janela de 1 min
+
+function checkStatus(ipAddress) {
+    if (!ipAddress) return { status: 'OK' };
+    var resultStatus = 'OK';
+
+    Transaction.wrap(function () {
+        var velocityRecord = CustomObjectMgr.getCustomObject('FraudVelocity', ipAddress);
+        
+        if (!velocityRecord) {
+            velocityRecord = CustomObjectMgr.createCustomObject('FraudVelocity', ipAddress);
+            velocityRecord.custom.requestCount = 1;
+            velocityRecord.custom.windowStartTime = new Date();
+            return;
+        }
+
+        var now = new Date();
+        var timeDiff = (now.getTime() - velocityRecord.custom.windowStartTime.getTime()) / 1000;
+
+        if (timeDiff > WINDOW_SEC) {
+            velocityRecord.custom.requestCount = 1; // Reset janela
+            velocityRecord.custom.windowStartTime = now;
+        } else {
+            velocityRecord.custom.requestCount += 1;
+            var count = velocityRecord.custom.requestCount;
+
+            if (count >= LIMIT_HARD) {
+                resultStatus = 'BLOCK';
+            } else if (count >= LIMIT_SOFT) {
+                var validUntil = velocityRecord.custom.captchaVerifiedUntil;
+                if (!validUntil || validUntil < now) {
+                    resultStatus = 'REQUIRE_CAPTCHA';
+                }
+            }
+        }
+    });
+
+    if (resultStatus === 'BLOCK') {
+        FraudMgr.blockIP(ipAddress, 15); // Bloqueia por 15 min
+    }
+
+    return { status: resultStatus };
+}
+
+function setCaptchaVerified(ipAddress) {
+    Transaction.wrap(function () {
+        var rec = CustomObjectMgr.getCustomObject('FraudVelocity', ipAddress);
+        if (rec) {
+            var cal = new dw.util.Calendar();
+            cal.add(dw.util.Calendar.MINUTE, 5); // 5 min de "imunidade"
+            rec.custom.captchaVerifiedUntil = cal.time;
+            rec.custom.requestCount = 0; // Opcional: Resetar contador
+        }
+    });
+}
+
+module.exports = {
+    checkStatus: checkStatus,
+    setCaptchaVerified: setCaptchaVerified
+};
+
+
+4.2. Serviço de Validação
+Arquivo: */cartridge/scripts/services/RecaptchaService.js
+
+var LocalServiceRegistry = require('dw/svc/LocalServiceRegistry');
+
+var recaptchaService = LocalServiceRegistry.createService('GoogleRecaptcha.Verify', {
+    createRequest: function (svc, params) {
+        svc.setRequestMethod('POST');
+        svc.addHeader('Content-Type', 'application/x-www-form-urlencoded');
+        return 'secret=' + params.secret + '&response=' + params.token;
+    },
+    parseResponse: function (svc, client) {
+        return JSON.parse(client.text);
+    }
+});
+
+function verify(token, secretKey) {
+    var result = recaptchaService.call({ token: token, secret: secretKey });
+    return (result.ok && result.object && result.object.success);
+}
+
+module.exports = { verify: verify };
+
+4.3. Controller de Integração (Snippet)
+Arquivo: CheckoutServices.js (Dentro da rota de SubmitPayment)
+
+var FraudMgr = require('*/cartridge/scripts/helpers/FraudMgr');
+var VelocityMgr = require('*/cartridge/scripts/helpers/VelocityMgr');
+var RecaptchaService = require('*/cartridge/scripts/services/RecaptchaService');
+var Site = require('dw/system/Site');
+
+// 1. Identificação
+var clientIP = req.httpRemoteAddress;
+var customerNo = req.currentCustomer.profile ? req.currentCustomer.profile.customerNo : null;
+var captchaToken = req.form.gRecaptchaResponse;
+
+// 2. Verifica Bloqueio Prévio
+if (FraudMgr.isBlocked(clientIP, customerNo)) {
+    res.setStatusCode(403);
+    res.json({ error: true, errorMessage: "Acesso temporariamente suspenso." });
+    return next();
+}
+
+// 3. Verifica Velocidade
+var vCheck = VelocityMgr.checkStatus(clientIP);
+
+if (vCheck.status === 'BLOCK') {
+    res.setStatusCode(429);
+    res.json({ error: true, errorMessage: "Muitas tentativas. Bloqueado por 15 min." });
+    return next();
+}
+
+if (vCheck.status === 'REQUIRE_CAPTCHA') {
+    if (!captchaToken) {
+        res.json({ error: true, authRequired: true, errorMessage: "Verifique o Captcha." });
+        return next();
+    }
+    var secret = Site.getCurrent().getCustomPreferenceValue('recaptchaSecretKey');
+    if (!RecaptchaService.verify(captchaToken, secret)) {
+        res.json({ error: true, errorMessage: "Falha na validação do Captcha." });
+        return next();
+    }
+    VelocityMgr.setCaptchaVerified(clientIP);
+}
+
+// ... Prossegue para Pagamento ...
+
+// 4. Pós-Pagamento (Se houver fraude confirmada pelo Gateway)
+if (paymentResult.error && paymentResult.isFraud) {
+    if (customerNo) FraudMgr.blockCustomer(customerNo, 15);
+    else FraudMgr.blockIP(clientIP, 15);
+}
+
+5. Códigos: Business Manager (Gestão)
+5.1. Controller do Painel
+
+Arquivo: */cartridge/controllers/FraudAdmin.jsJavaScript
+
+'use strict';
+var server = require('server');
+var CustomObjectMgr = require('dw/object/CustomObjectMgr');
+var Transaction = require('dw/system/Transaction');
+var URLUtils = require('dw/web/URLUtils');
+var FraudMgr = require('*/cartridge/scripts/helpers/FraudMgr');
+var CSRFProtection = require('dw/web/CSRFProtection');
+
+server.get('Show', server.middleware.https, function (req, res, next) {
+    var blocks = [];
+    var searchResult = CustomObjectMgr.getAllCustomObjects('FraudTempBlock');
+    
+    while (searchResult.hasNext()) {
+        var co = searchResult.next();
+        var fullId = co.custom.clientIP; // Assumindo que o Key Attribute foi mapeado
+        var type = fullId.indexOf('IP_') === 0 ? 'IP' : 'CLIENTE';
+        var value = fullId.indexOf('_') > -1 ? fullId.split('_')[1] : fullId;
+
+        blocks.push({
+            fullId: fullId,
+            type: type,
+            value: value,
+            expiration: co.custom.blockExpiration,
+            reason: co.custom.reason
+        });
+    }
+    searchResult.close();
+
+    res.render('fraud/fraudAdminDashboard', {
+        blocks: blocks,
+        actionRemove: URLUtils.url('FraudAdmin-Unblock').toString(),
+        actionAdd: URLUtils.url('FraudAdmin-ManualBlock').toString(),
+        csrf: CSRFProtection.getTokenName() + '=' + CSRFProtection.generateToken()
+    });
+    next();
+});
+
+server.post('ManualBlock', server.middleware.https, function (req, res, next) {
+    var type = req.form.blockType;
+    var value = req.form.blockValue;
+    var duration = parseInt(req.form.blockDuration, 10);
+    
+    if (type === 'IP') FraudMgr.blockIP(value, duration);
+    else FraudMgr.blockCustomer(value, duration);
+
+    res.redirect(URLUtils.url('FraudAdmin-Show'));
+    next();
+});
+
+server.post('Unblock', server.middleware.https, function (req, res, next) {
+    var idToRemove = req.form.blockId;
+    Transaction.wrap(function () {
+        var co = CustomObjectMgr.getCustomObject('FraudTempBlock', idToRemove);
+        if (co) CustomObjectMgr.remove(co);
+    });
+    res.redirect(URLUtils.url('FraudAdmin-Show'));
+    next();
+});
+
+module.exports = server.exports();
+
+5.2. Template ISML
+Arquivo: */cartridge/templates/default/fraud/fraudAdminDashboard.isml
+
+<isdecorate template="application/MenuFrame">
+<div style="padding: 20px; font-family: sans-serif;">
+    <h1>🛡️ Painel Anti-Fraude</h1>
+    
+    <div style="background: #f4f6f9; padding: 15px; margin-bottom: 20px; border: 1px solid #ddd;">
+        <h3>Bloqueio Manual</h3>
+        <form action="${pdict.actionAdd}" method="POST">
+            <select name="blockType"><option value="IP">IP</option><option value="USER">Cliente ID</option></select>
+            <input type="text" name="blockValue" placeholder="Valor" required>
+            <input type="number" name="blockDuration" value="60" style="width: 50px;"> min
+            <input type="hidden" name="${pdict.csrf.split('=')[0]}" value="${pdict.csrf.split('=')[1]}"/>
+            <button type="submit" style="background: #c23934; color: white;">Bloquear</button>
+        </form>
+    </div>
+
+    <table width="100%" border="1" cellpadding="5" style="border-collapse: collapse;">
+        <thead><tr><th>Tipo</th><th>Valor</th><th>Motivo</th><th>Expira em</th><th>Ação</th></tr></thead>
+        <tbody>
+            <isloop items="${pdict.blocks}" var="item">
+                <tr>
+                    <td>${item.type}</td>
+                    <td>${item.value}</td>
+                    <td>${item.reason}</td>
+                    <td><isprint value="${item.expiration}" style="DATE_TIME" /></td>
+                    <td>
+                        <form action="${pdict.actionRemove}" method="POST">
+                            <input type="hidden" name="blockId" value="${item.fullId}">
+                            <button type="submit">Desbloquear</button>
+                        </form>
+                    </td>
+                </tr>
+            </isloop>
+        </tbody>
+    </table>
+</div>
+</isdecorate>
+
+6. Job de Limpeza (Maintenance)
+Arquivo: */cartridge/scripts/jobs/FraudCleanup.jsConfigure este job para rodar 1x ao dia.
+
+'use strict';
+var CustomObjectMgr = require('dw/object/CustomObjectMgr');
+var Transaction = require('dw/system/Transaction');
+
+function execute() {
+    var now = new Date();
+    
+    // 1. Limpa Bloqueios Expirados
+    var blocks = CustomObjectMgr.queryCustomObjects('FraudTempBlock', "custom.blockExpiration < {0}", null, now);
+    while (blocks.hasNext()) {
+        var co = blocks.next();
+        Transaction.wrap(function(){ CustomObjectMgr.remove(co); });
+    }
+    blocks.close();
+
+    // 2. Limpa Contadores Antigos (> 24h)
+    var yesterday = new Date(); yesterday.setHours(yesterday.getHours() - 24);
+    var vels = CustomObjectMgr.queryCustomObjects('FraudVelocity', "custom.windowStartTime < {0}", null, yesterday);
+    while (vels.hasNext()) {
+        var co = vels.next();
+        Transaction.wrap(function(){ CustomObjectMgr.remove(co); });
+    }
+    vels.close();
+
+    return require('dw/system/Status').OK;
+}
+module.exports = { execute: execute };
