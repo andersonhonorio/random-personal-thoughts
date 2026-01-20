@@ -102,6 +102,7 @@ Caminho: *Administration > Operations > Services*
 Arquivo: */cartridge/scripts/helpers/FraudMgr.js
 Responsável por gerenciar a "Lista Negra" persistente
 
+```
 'use strict';
 
 var CustomObjectMgr = require('dw/object/CustomObjectMgr');
@@ -154,11 +155,12 @@ module.exports = {
     blockIP: blockIP,
     isBlocked: isBlocked
 };
-
+```
 
 Arquivo: */cartridge/scripts/helpers/VelocityMgr.js
 Responsável pela contagem de tentativas e decisão de Captcha/Bloqueio.
 
+```
 'use strict';
 
 var CustomObjectMgr = require('dw/object/CustomObjectMgr');
@@ -228,11 +230,12 @@ module.exports = {
     checkStatus: checkStatus,
     setCaptchaVerified: setCaptchaVerified
 };
-
+```
 
 4.2. Serviço de Validação
 Arquivo: */cartridge/scripts/services/RecaptchaService.js
 
+```
 var LocalServiceRegistry = require('dw/svc/LocalServiceRegistry');
 
 var recaptchaService = LocalServiceRegistry.createService('GoogleRecaptcha.Verify', {
@@ -252,10 +255,12 @@ function verify(token, secretKey) {
 }
 
 module.exports = { verify: verify };
+```
 
 4.3. Controller de Integração (Snippet)
 Arquivo: CheckoutServices.js (Dentro da rota de SubmitPayment)
 
+```
 var FraudMgr = require('*/cartridge/scripts/helpers/FraudMgr');
 var VelocityMgr = require('*/cartridge/scripts/helpers/VelocityMgr');
 var RecaptchaService = require('*/cartridge/scripts/services/RecaptchaService');
@@ -302,12 +307,14 @@ if (paymentResult.error && paymentResult.isFraud) {
     if (customerNo) FraudMgr.blockCustomer(customerNo, 15);
     else FraudMgr.blockIP(clientIP, 15);
 }
+```
 
 5. Códigos: Business Manager (Gestão)
 5.1. Controller do Painel
 
 Arquivo: */cartridge/controllers/FraudAdmin.jsJavaScript
 
+```
 'use strict';
 var server = require('server');
 var CustomObjectMgr = require('dw/object/CustomObjectMgr');
@@ -368,10 +375,12 @@ server.post('Unblock', server.middleware.https, function (req, res, next) {
 });
 
 module.exports = server.exports();
+```
 
 5.2. Template ISML
 Arquivo: */cartridge/templates/default/fraud/fraudAdminDashboard.isml
 
+```
 <isdecorate template="application/MenuFrame">
 <div style="padding: 20px; font-family: sans-serif;">
     <h1>🛡️ Painel Anti-Fraude</h1>
@@ -408,10 +417,12 @@ Arquivo: */cartridge/templates/default/fraud/fraudAdminDashboard.isml
     </table>
 </div>
 </isdecorate>
+```
 
 6. Job de Limpeza (Maintenance)
 Arquivo: */cartridge/scripts/jobs/FraudCleanup.jsConfigure este job para rodar 1x ao dia.
 
+```
 'use strict';
 var CustomObjectMgr = require('dw/object/CustomObjectMgr');
 var Transaction = require('dw/system/Transaction');
@@ -439,3 +450,4 @@ function execute() {
     return require('dw/system/Status').OK;
 }
 module.exports = { execute: execute };
+```
