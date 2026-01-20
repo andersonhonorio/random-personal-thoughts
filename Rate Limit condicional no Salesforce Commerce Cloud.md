@@ -68,7 +68,7 @@ reason,String,Não,"Motivo do bloqueio (ex: ""API Reject 5""). Útil para audito
 4.1. Helper Script (RateLimitHelper.js)
 Este é o módulo central. Salve em: */cartridge/scripts/helpers/RateLimitHelper.js
 
-```
+```javascript
 'use strict';
 
 /**
@@ -168,7 +168,7 @@ module.exports = {
 
 Exemplo de implementação dentro de uma rota de controller.
 
-```
+```javascript
 var server = require('server');
 
 var RateLimitHelper = require('*/cartridge/scripts/helpers/RateLimitHelper');
@@ -229,7 +229,7 @@ module.exports = server.exports;
 O frontend deve estar preparado para lidar com o status HTTP 429 ou com a mensagem de erro JSON retornada.
 Exemplo Ajax (jQuery/Zepto padrão SFCC)
 
-```
+```javascript
 $.ajax({
     url: 'CheckoutServices-SubmitPayment',
     method: 'POST',
