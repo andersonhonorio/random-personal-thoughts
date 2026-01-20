@@ -63,7 +63,7 @@ Rel(admin, admin_ctrl, "Painel Admin", "HTTPS/BM")
 Rel(admin_ctrl, co_block, "Gerencia", "API")
 Rel(job_cleanup, co_velocity, "Limpa", "Scheduled")
 @enduml
-
+```
 
 # 3. Configuração Business Manager
 
@@ -99,10 +99,10 @@ Caminho: *Administration > Operations > Services*
 
 4. Códigos: Camada Core e Storefront
 4.1. Helpers (Lógica de Negócio)
-Arquivo: */cartridge/scripts/helpers/FraudMgr.js
+Arquivo: `*/cartridge/scripts/helpers/FraudMgr.js`
 Responsável por gerenciar a "Lista Negra" persistente
 
-```
+```javascript
 'use strict';
 
 var CustomObjectMgr = require('dw/object/CustomObjectMgr');
@@ -157,10 +157,10 @@ module.exports = {
 };
 ```
 
-Arquivo: */cartridge/scripts/helpers/VelocityMgr.js
+Arquivo: `*/cartridge/scripts/helpers/VelocityMgr.js`
 Responsável pela contagem de tentativas e decisão de Captcha/Bloqueio.
 
-```
+```javascript
 'use strict';
 
 var CustomObjectMgr = require('dw/object/CustomObjectMgr');
@@ -233,9 +233,9 @@ module.exports = {
 ```
 
 4.2. Serviço de Validação
-Arquivo: */cartridge/scripts/services/RecaptchaService.js
+Arquivo: `*/cartridge/scripts/services/RecaptchaService.js`
 
-```
+```javascript
 var LocalServiceRegistry = require('dw/svc/LocalServiceRegistry');
 
 var recaptchaService = LocalServiceRegistry.createService('GoogleRecaptcha.Verify', {
@@ -258,9 +258,9 @@ module.exports = { verify: verify };
 ```
 
 4.3. Controller de Integração (Snippet)
-Arquivo: CheckoutServices.js (Dentro da rota de SubmitPayment)
+Arquivo: `CheckoutServices.js (Dentro da rota de SubmitPayment)`
 
-```
+```javascript
 var FraudMgr = require('*/cartridge/scripts/helpers/FraudMgr');
 var VelocityMgr = require('*/cartridge/scripts/helpers/VelocityMgr');
 var RecaptchaService = require('*/cartridge/scripts/services/RecaptchaService');
@@ -312,9 +312,9 @@ if (paymentResult.error && paymentResult.isFraud) {
 5. Códigos: Business Manager (Gestão)
 5.1. Controller do Painel
 
-Arquivo: */cartridge/controllers/FraudAdmin.jsJavaScript
+Arquivo: `*/cartridge/controllers/FraudAdmin.js`
 
-```
+```javascript
 'use strict';
 var server = require('server');
 var CustomObjectMgr = require('dw/object/CustomObjectMgr');
@@ -378,9 +378,9 @@ module.exports = server.exports();
 ```
 
 5.2. Template ISML
-Arquivo: */cartridge/templates/default/fraud/fraudAdminDashboard.isml
+Arquivo: `*/cartridge/templates/default/fraud/fraudAdminDashboard.isml`
 
-```
+```HTML
 <isdecorate template="application/MenuFrame">
 <div style="padding: 20px; font-family: sans-serif;">
     <h1>🛡️ Painel Anti-Fraude</h1>
@@ -420,9 +420,9 @@ Arquivo: */cartridge/templates/default/fraud/fraudAdminDashboard.isml
 ```
 
 6. Job de Limpeza (Maintenance)
-Arquivo: */cartridge/scripts/jobs/FraudCleanup.jsConfigure este job para rodar 1x ao dia.
+Arquivo: `*/cartridge/scripts/jobs/FraudCleanup.jsP`. Configure este job para rodar 1x ao dia.
 
-```
+```javascript
 'use strict';
 var CustomObjectMgr = require('dw/object/CustomObjectMgr');
 var Transaction = require('dw/system/Transaction');
